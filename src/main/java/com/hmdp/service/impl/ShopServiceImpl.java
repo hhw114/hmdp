@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.hmdp.dto.Result;
@@ -44,18 +45,57 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         if(shopJson != null){
             return Result.fail("店铺信息不存在!");
         }
-        //3.不存在，根据id查询数据库
-        Shop shop = getById(id);
-        //4.数据库不存在，返回错误并把空值存入redis
-        if(shop==null){
-            stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, "",CACHE_NULL_TTL,TimeUnit.MINUTES);
-            return Result.fail("店铺不存在!");
+
+        //尝试获取互斥锁，重新建立缓存
+        String lockKey = LOCK_SHOP_KEY + id;
+        Shop shop = null;
+        try {
+            boolean isLock = tryLock(lockKey);
+            if (!isLock) {
+                //没有得到锁，休眠重试
+                Thread.sleep(50);
+                return queryById(id);
+            }
+
+            //得到了锁，二次检查缓存是否存在，防止其他线程已经重建缓存
+            shopJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
+            if (StrUtil.isNotBlank(shopJson)) {
+                //发现已经重建，直接返回
+                shop = JSONUtil.toBean(shopJson, Shop.class);
+                return Result.ok(shop);
+            }
+            if (shopJson != null) {
+                return Result.fail("店铺信息不存在!");
+            }
+            //没有重建，准备重建
+            //3.不存在，根据id查询数据库
+            shop = getById(id);
+            //4.数据库不存在，返回错误并把空值存入redis
+            if (shop == null) {
+                stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+                return Result.fail("店铺不存在!");
+            }
+            //5.存在，写入redis
+            stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        }catch (InterruptedException e){
+            throw new RuntimeException(e);
+        }finally {
+            unlock(lockKey);
         }
-        //5.存在，写入redis
-        stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id,JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL, TimeUnit.MINUTES);
         //6.返回前端
         return Result.ok(shop);
     }
+    //加锁，用于查询shop时对读操作防止缓存击穿
+    private boolean tryLock(String key){
+        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
+        return BooleanUtil.isTrue(flag);
+    }
+
+    //解锁
+    private void unlock(String key){
+        stringRedisTemplate.delete(key);
+    }
+
 
     @Override
     @Transactional
