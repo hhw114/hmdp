@@ -8,6 +8,7 @@ import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.CacheClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -29,58 +30,24 @@ import static com.hmdp.utils.RedisConstants.*;
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+    @Autowired
+    private CacheClient cacheClient;
     @Override
     public Result queryById(Long id) {
         //TODO 加入布隆过滤器应对缓存穿透
         //TODO 加入随机值等方法解决缓存雪崩
-        //1.从redis查询商铺缓存
-        String shopJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
-        //2.判断是否存在，存在直接返回
-        if(StrUtil.isNotBlank(shopJson)){//isNotBlank方法里，空字符串，只有换行符也算空
-            //存在，返回
-            Shop shop = JSONUtil.toBean(shopJson, Shop.class);
-            return Result.ok(shop);
-        }
-        //不存在，判断是否为空值（空值也算不存在）
-        if(shopJson != null){
-            return Result.fail("店铺信息不存在!");
-        }
-
-        //尝试获取互斥锁，重新建立缓存
-        String lockKey = LOCK_SHOP_KEY + id;
-        Shop shop = null;
-        try {
-            boolean isLock = tryLock(lockKey);
-            if (!isLock) {
-                //没有得到锁，休眠重试
-                Thread.sleep(50);
-                return queryById(id);
-            }
-
-            //得到了锁，二次检查缓存是否存在，防止其他线程已经重建缓存
-            shopJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
-            if (StrUtil.isNotBlank(shopJson)) {
-                //发现已经重建，直接返回
-                shop = JSONUtil.toBean(shopJson, Shop.class);
-                return Result.ok(shop);
-            }
-            if (shopJson != null) {
-                return Result.fail("店铺信息不存在!");
-            }
-            //没有重建，准备重建
-            //3.不存在，根据id查询数据库
-            shop = getById(id);
-            //4.数据库不存在，返回错误并把空值存入redis
-            if (shop == null) {
-                stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
-                return Result.fail("店铺不存在!");
-            }
-            //5.存在，写入redis
-            stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
-        }catch (InterruptedException e){
-            throw new RuntimeException(e);
-        }finally {
-            unlock(lockKey);
+        //调用CacheClient里的方法，其已经实现带缓存穿透和击穿防护的查询
+        Shop shop = cacheClient.queryWithPassThrough(
+                CACHE_SHOP_KEY,
+                id,
+                Shop.class,
+                this::getById,
+                CACHE_SHOP_TTL,
+                TimeUnit.MINUTES
+        );
+        if(shop == null){
+            //不存在
+            return Result.fail("店铺信息不存在！");
         }
         //6.返回前端
         return Result.ok(shop);
