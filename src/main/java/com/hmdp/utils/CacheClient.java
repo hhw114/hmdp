@@ -129,8 +129,11 @@ public class CacheClient {
      * 适用于热点数据，缓存永不过期，通过逻辑过期字段控制更新
      * 优点：永远不会出现缓存击穿，查询永远不阻塞
      * 缺点：可能返回旧数据（短暂不一致）
+     * 使用这种逻辑过期的版本必须要预热,否则第一次会返回null并重建逻辑缓存
+     * 如果查询为空值，将持续缓存穿透
      */
-    //TODO 这里有严重问题，如热点商品没预热，降级为物理ttl查询后会在redis里构建普通缓存，下次热点缓存试图把json转为redisdata格式会异常
+    //TODO 加入布隆过滤器
+
     public <R, ID> R queryWithLogicalExpire(
             String keyPrefix, ID id, Class<R> type,
             Function<ID, R> dbFallback, Long time, TimeUnit timeUnit
@@ -142,9 +145,37 @@ public class CacheClient {
         String redisString = stringRedisTemplate.opsForValue().get(cacheKey);
 
         // 2. 未命中（理论上逻辑过期方案缓存应该一直存在，如果不存在说明不是热点数据）
-        if (StrUtil.isBlank(redisString)) {
-            // 降级到普通查询（或直接查库）
-            return queryWithPassThrough(keyPrefix, id, type, dbFallback, time, timeUnit);
+        if (StrUtil.isBlank(redisString)) {//可能是空值或者""
+            //重建缓存
+            boolean hasLock = tryLock(lockKey);
+
+            if (hasLock) {
+                // 获取锁成功，开启独立线程重建缓存（不阻塞当前请求）
+                CACHE_EXECUTOR.submit(() -> {
+                    try {
+                        // 双重检查：可能其他线程已经重建
+                        String newRedisString = stringRedisTemplate.opsForValue().get(cacheKey);
+                        if (StrUtil.isNotBlank(newRedisString)) {
+                            RedisData newRedisData = JSONUtil.toBean(newRedisString, RedisData.class);
+                            if (newRedisData.getExpireTime().isAfter(LocalDateTime.now())) {
+                                return; // 已被其他线程重建
+                            }
+                        }
+
+                        // 查询数据库
+                        R newResult = dbFallback.apply(id);
+                        if (newResult != null) {
+                            // 写入缓存（逻辑过期）
+                            setWithLogicalExpire(cacheKey, newResult, time, timeUnit);
+                        }
+                    } finally {
+                        // 释放锁
+                        unlock(lockKey);
+                    }
+                });
+            }
+            return null;
+
         }
 
         // 3. 命中，解析数据
