@@ -83,8 +83,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             voucherOrder.setVoucherId(voucherId);
             voucherOrder.setId(orderId);
 
-            // 3. 写入数据库
-            save(voucherOrder);
+            // 3. 保存订单 + 扣减库存（需要事务）
+            saveOrderAndReduceStock(voucherOrder, voucherId);
 
             // 4. RabbitMQ 会自动 ACK，不需要手动调用
             // 方法正常返回 = 自动 ACK 确认
@@ -99,6 +99,25 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             // 抛出异常，消息会重新入队（类似 pending-list 的效果）
             throw new RuntimeException("处理失败，消息重新入队", e);
         }
+    }
+    @Transactional  // 添加事务，保证订单和库存同时成功或同时失败
+    public void saveOrderAndReduceStock(VoucherOrder voucherOrder, Long voucherId) {
+        // 1. 保存订单
+        save(voucherOrder);
+
+        // 2. 扣减数据库库存（关键！）
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0)  // 库存大于0才扣减，防止超卖
+                .update();
+
+        if (!success) {
+            log.error("扣减库存失败，voucherId={}", voucherId);
+            throw new RuntimeException("扣减库存失败");
+        }
+
+        log.info("订单保存成功，库存扣减成功: orderId={}, voucherId={}", voucherOrder.getId(), voucherId);
     }
 //    private class VoucherOrderHandler implements Runnable {
 //        String queueName = "stream.orders";
